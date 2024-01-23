@@ -121,7 +121,8 @@ class SelfAttention(nn.Module):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_complex: torch.Tensor
+        freqs_complex: torch.Tensor,
+        mask: Optional[torch.Tensor],
     ):
         batch_size, seq_len, _ = x.shape  # (B, 1, Dim)
 
@@ -169,6 +170,8 @@ class SelfAttention(nn.Module):
 
         # (B, H_Q, 1, Head_Dim) @ (B, H_Q, Head_Dim, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         # (B, H_Q, 1, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
 
@@ -226,10 +229,10 @@ class EncoderBlock(nn.Module):
         # Normalization BEFORE the feed forward block
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
     
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor, mask: Optional[torch.Tensor]):
         # (B, Seq_Len, Dim) + (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
         h = x + self.attention.forward(
-            self.attention_norm(x), start_pos, freqs_complex
+            self.attention_norm(x), start_pos, freqs_complex, mask
         )
         # (B, Seq_Len, Dim) + (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
         out = h + self.feed_forward.forward(self.ffn_norm(h))
@@ -254,22 +257,34 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.output = nn.Linear(args.dim, self.vocab_size, bias=False)
 
-        self.freqs_complex = precompute_theta_pos_frequencies(self.args.dim // self.args.n_heads, self.args.max_seq_len * 2, device=self.args.device)
+        self.freqs_cis = precompute_theta_pos_frequencies(self.args.dim // self.args.n_heads, self.args.max_seq_len * 2, device=self.args.device)
 
     def forward(self, tokens: torch.Tensor, start_pos: int):
         # (B, Seq_Len)
-        batch_size, seq_len = tokens.shape
-        assert seq_len == 1, "Only one token at a time can be processed"
-
-        # (B, Seq_Len) -> (B, Seq_Len, Dim)
+        _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
+        self.freqs_cis = self.freqs_cis.to(h.device)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
-        # Retrieve the pairs (m, theta) corresponding to the positions [start_pos, start_pos + seq_len]
-        freqs_complex = self.freqs_complex[start_pos:start_pos + seq_len]
-        
-        # Consecutively apply all the encoder layers
+        mask = None
+        if seqlen > 1:
+            mask = torch.full(
+                (seqlen, seqlen), float("-inf"), device=tokens.device
+            )
+
+            mask = torch.triu(mask, diagonal=1)
+
+            # When performing key-value caching, we compute the attention scores
+            # only for the new sequence. Thus, the matrix of scores is of size
+            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+            # j > cache_len + i, since row i corresponds to token cache_len + i.
+            mask = torch.hstack([
+                torch.zeros((seqlen, start_pos), device=tokens.device),
+                mask
+            ]).type_as(h)
+
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_complex)
+            h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
         output = self.output(h).float()
         return output
