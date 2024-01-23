@@ -25,13 +25,14 @@ def chat():
     try:
         payload = request.get_json()
         msg = payload["msg"]
-        max_seq_len = payload.get("max_seq_len")
-        top_p = payload.get("top_p")
-        temperature = payload.get("temperature") 
+        max_seq_len = int(payload.get("max_seq_len") or 1024)
+        top_p = int(payload.get("top_p") or 0.9)
+        temperature = int(payload.get("temperature") or 0.6)
+        system = str(payload.get("system") or "") 
         
         dialogs: List[Dialog] = [
             [
-                {"role": "system", "content": "You are a friendly chatbot named iViVi, you are develop by IVIRSE and always response in Vietnamese"},
+                {"role": "system", "content": "You are a friendly chatbot named iViVi, you are develop by IVIRSE and always response in Vietnamese. " + system},
                 {"role": "user", "content": msg}
             ]
         ]
